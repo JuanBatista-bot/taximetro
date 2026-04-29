@@ -1,0 +1,526 @@
+  import 'package:flutter/material.dart';
+    import 'package:location/location.dart' as loc;
+    import 'package:google_maps_flutter/google_maps_flutter.dart';
+    import 'package:shared_preferences/shared_preferences.dart';
+    import 'package:csv/csv.dart';
+    import 'package:path_provider/path_provider.dart';
+    import 'package:share_plus/share_plus.dart';
+    import 'dart:io';
+    import 'dart:async';
+    import 'package:intl/intl.dart';
+    import 'dart:math';
+    
+    void main() {
+    runApp(TaximetroApp());
+  }
+    
+    class TaximetroApp extends StatelessWidget {
+    @override
+    Widget build(BuildContext context) {
+    return MaterialApp(
+  title: 'Taxímetro',
+  theme: ThemeData(primarySwatch: Colors.blue),
+  home: MainPage(),
+    );
+  }
+  }
+
+    class MainPage extends StatefulWidget {
+    @override
+    _MainPageState createState() => _MainPageState();
+  }
+
+    class _MainPageState extends State<MainPage> {
+    int _currentIndex = 0;
+    final List<Widget> _pages = [
+    TaximetroPage(),
+    MapPage(),
+    SettingsPage(),
+  ];
+    
+    @override
+    Widget build(BuildContext context) {
+    return Scaffold(
+  body: _pages[_currentIndex],
+  bottomNavigationBar: BottomNavigationBar(
+    currentIndex: _currentIndex,
+    onTap: (index) => setState(() => _currentIndex = index),
+    items: [
+      BottomNavigationBarItem(icon: Icon(Icons.monetization_on), label: 'Taxímetro'),
+      BottomNavigationBarItem(icon: Icon(Icons.map), label: 'Mapa'),
+      BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Ajustes'),
+    ],
+    ),
+    );
+  }
+  }
+
+    // ----------------- MODELO DE VIAJE -----------------
+    class Trip {
+    DateTime startTime;
+    DateTime endTime;
+    double distanceMiles;
+    double waitMinutes;
+    double totalFare;
+    
+    Trip({
+    required this.startTime,
+    required this.endTime,
+    required this.distanceMiles,
+    required this.waitMinutes,
+    required this.totalFare,
+  });
+    
+    Map<String, dynamic> toJson() => {
+  'startTime': startTime.toIso8601String(),
+  'endTime': endTime.toIso8601String(),
+  'distanceMiles': distanceMiles,
+  'waitMinutes': waitMinutes,
+  'totalFare': totalFare,
+  };
+    
+    factory Trip.fromJson(Map<String, dynamic> json) => Trip(
+  startTime: DateTime.parse(json['startTime']),
+  endTime: DateTime.parse(json['endTime']),
+  distanceMiles: json['distanceMiles'],
+  waitMinutes: json['waitMinutes'],
+  totalFare: json['totalFare'],
+    );
+  }
+
+    // ----------------- ALMACENAMIENTO DE HISTORIAL -----------------
+    class TripStore {
+    static const _key = 'trip_history';
+    
+    Future<List<Trip>> loadTrips() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? data = prefs.getString(_key);
+    if (data == null) return [];
+    final List<dynamic> list = List<Map<String, dynamic>>.from(
+    const JsonDecoder().convert(data),
+    );
+    return list.map((e) => Trip.fromJson(e)).toList();
+  }
+
+    Future<void> saveTrips(List<Trip> trips) async {
+    final prefs = await SharedPreferences.getInstance();
+    final String json = const JsonEncoder().convert(
+    trips.map((e) => e.toJson()).toList(),
+    );
+    await prefs.setString(_key, json);
+  }
+  }
+
+    // ----------------- VIEW MODEL DEL TAXÍMETRO -----------------
+    class TaximeterProvider extends ChangeNotifier {
+    final loc.Location location = loc.Location();
+    final TripStore store = TripStore();
+    
+    // Tarifas por defecto
+    double fareBase = 3.0;
+    double farePerMile = 0.72;
+    double farePerMinuteWait = 0.25;
+    
+    bool isActive = false;
+    double distanceMiles = 0.0;
+    double waitMinutes = 0.0;
+    double totalFare = 3.0;
+    List<Trip> allTrips = [];
+    List<LatLng> route = [];
+    
+    DateTime? _startTime;
+    loc.LocationData? _lastLocation;
+    double _totalDistance = 0.0;
+    double _totalWaitSeconds = 0.0;
+    DateTime? _lastUpdate;
+    StreamSubscription<loc.LocationData>? _locationSubscription;
+    
+    TaximeterProvider() {
+    _loadFares();
+    _loadHistory();
+  }
+
+    Future<void> _loadFares() async {
+    final prefs = await SharedPreferences.getInstance();
+    fareBase = prefs.getDouble('fareBase') ?? 3.0;
+    farePerMile = prefs.getDouble('farePerMile') ?? 0.72;
+    farePerMinuteWait = prefs.getDouble('farePerMinuteWait') ?? 0.25;
+    if (!isActive) totalFare = fareBase;
+    notifyListeners();
+  }
+
+    Future<void> _saveFares() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble('fareBase', fareBase);
+    await prefs.setDouble('farePerMile', farePerMile);
+    await prefs.setDouble('farePerMinuteWait', farePerMinuteWait);
+  }
+
+    Future<void> _loadHistory() async {
+    allTrips = await store.loadTrips();
+    notifyListeners();
+  }
+
+    Future<void> startTrip() async {
+    if (isActive) return;
+    bool serviceEnabled = await location.serviceEnabled();
+    if (!serviceEnabled) {
+    serviceEnabled = await location.requestService();
+    if (!serviceEnabled) return;
+  }
+    PermissionStatus permission = await location.hasPermission();
+    if (permission == PermissionStatus.denied) {
+    permission = await location.requestPermission();
+    if (permission != PermissionStatus.granted) return;
+  }
+    // Reinicializar variables
+    _totalDistance = 0;
+    _totalWaitSeconds = 0;
+    _lastLocation = null;
+    _lastUpdate = null;
+    distanceMiles = 0;
+    waitMinutes = 0;
+    totalFare = fareBase;
+    route.clear();
+    _startTime = DateTime.now();
+    isActive = true;
+    notifyListeners();
+
+    _locationSubscription = location.onLocationChanged.listen((loc.LocationData current) {
+    if (!isActive) return;
+    final now = DateTime.now();
+    final deltaSeconds = _lastUpdate != null
+    ? now.difference(_lastUpdate!).inSeconds.toDouble()
+    : 0.0;
+    
+    if (_lastLocation != null) {
+    double distanceMeters = _calculateDistance(
+    _lastLocation!.latitude!, _lastLocation!.longitude!,
+    current.latitude!, current.longitude!,
+    );
+    double distanceMiles = distanceMeters / 1609.344;
+    _totalDistance += distanceMiles;
+  }
+
+    double speedMph = (current.speed ?? 0) * 2.23694; // m/s a mph
+    if (speedMph < 1.0 && deltaSeconds > 0) {
+    _totalWaitSeconds += deltaSeconds;
+  }
+
+    distanceMiles = _totalDistance;
+    waitMinutes = _totalWaitSeconds / 60.0;
+    totalFare = fareBase + distanceMiles * farePerMile + waitMinutes * farePerMinuteWait;
+    route.add(LatLng(current.latitude!, current.longitude!));
+    
+    _lastLocation = current;
+    _lastUpdate = now;
+    notifyListeners();
+  });
+  }
+
+    Future<void> stopTrip() async {
+    if (!isActive) return;
+    isActive = false;
+    await _locationSubscription?.cancel();
+    _locationSubscription = null;
+
+    if (_startTime != null) {
+    Trip trip = Trip(
+  startTime: _startTime!,
+  endTime: DateTime.now(),
+  distanceMiles: distanceMiles,
+  waitMinutes: waitMinutes,
+  totalFare: totalFare,
+    );
+    allTrips.insert(0, trip);
+    await store.saveTrips(allTrips);
+  }
+    notifyListeners();
+  }
+
+    double _calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+    const R = 6371000; // metros
+    double dLat = radians(lat2 - lat1);
+    double dLon = radians(lon2 - lon1);
+    double a = sin(dLat / 2) * sin(dLat / 2) +
+    cos(radians(lat1)) * cos(radians(lat2)) *
+    sin(dLon / 2) * sin(dLon / 2);
+    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return R * c;
+  }
+
+    double radians(double deg) => deg * pi / 180;
+    
+    Future<String> exportCsv() async {
+    List<List<String>> rows = [
+    ['Fecha inicio', 'Fecha fin', 'Distancia (mi)', 'Espera (min)', 'Total (\$)'],
+  ];
+    DateFormat fmt = DateFormat('yyyy-MM-dd HH:mm:ss');
+    for (var t in allTrips) {
+    rows.add([
+    fmt.format(t.startTime),
+    fmt.format(t.endTime),
+    t.distanceMiles.toStringAsFixed(2),
+    t.waitMinutes.toStringAsFixed(2),
+    t.totalFare.toStringAsFixed(2),
+    ]);
+    }
+    String csv = const ListToCsvConverter().convert(rows);
+    final dir = await getTemporaryDirectory();
+    final file = File('${dir.path}/taximetro_viajes.csv');
+    await file.writeAsString(csv);
+    return file.path;
+    }
+    
+    void clearHistory() async {
+    allTrips.clear();
+    await store.saveTrips(allTrips);
+    notifyListeners();
+    }
+    
+    void updateFares(double base, double perMile, double perMinWait) {
+    fareBase = base;
+    farePerMile = perMile;
+    farePerMinuteWait = perMinWait;
+    _saveFares();
+    if (!isActive) totalFare = fareBase;
+    notifyListeners();
+    }
+    
+    @override
+    void dispose() {
+    _locationSubscription?.cancel();
+    super.dispose();
+    }
+  }
+
+    // ----------------- PÁGINA DEL TAXÍMETRO -----------------
+    class TaximetroPage extends StatefulWidget {
+    @override
+    _TaximetroPageState createState() => _TaximetroPageState();
+  }
+
+    class _TaximetroPageState extends State<TaximetroPage> {
+    final TaximeterProvider provider = TaximeterProvider();
+    
+    @override
+    void dispose() {
+    provider.dispose();
+    super.dispose();
+    }
+    
+    @override
+    Widget build(BuildContext context) {
+    return AnimatedBuilder(
+  animation: provider,
+  builder: (context, _) => Scaffold(
+    appBar: AppBar(title: Text('Taxímetro')),
+    body: Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        children: [
+          Row(
+          children: [
+            Expanded(
+            child: ElevatedButton(
+              onPressed: provider.isActive ? null : () => provider.startTrip(),
+            child: Text('Iniciar'),
+            ),
+            ),
+            SizedBox(width: 10),
+            Expanded(
+            child: ElevatedButton(
+              onPressed: !provider.isActive ? null : () => provider.stopTrip(),
+              child: Text('Finalizar'),
+            ),
+            ),
+          ],
+          ),
+          SizedBox(height: 20),
+          Text('Distancia: ${provider.distanceMiles.toStringAsFixed(2)} millas'),
+          Text('Tiempo de espera: ${provider.waitMinutes.toStringAsFixed(2)} min'),
+          Text('Total: \$${provider.totalFare.toStringAsFixed(2)}',
+                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+              Divider(height: 30),
+              Text('Historial de viajes', style: TextStyle(fontWeight: FontWeight.bold)),
+          Expanded(
+          child: ListView.builder(
+            itemCount: provider.allTrips.length,
+          itemBuilder: (context, index) {
+                                          final trip = provider.allTrips[index];
+                                          return ListTile(
+            title: Text(DateFormat('dd/MM/yyyy HH:mm').format(trip.startTime)),
+            subtitle: Text(
+                        '${trip.distanceMiles.toStringAsFixed(2)} mi, ${trip.waitMinutes.toStringAsFixed(1)} min espera',
+                                          ),
+            trailing: Text('\$${trip.totalFare.toStringAsFixed(2)}'),
+                    );
+                  },
+                ),
+              ),
+              ElevatedButton.icon(
+                onPressed: provider.allTrips.isEmpty
+                    ? null
+                    : () async {
+                        String path = await provider.exportCsv();
+                        await Share.shareXFiles([XFile(path)], text: 'Historial taxímetro');
+          },
+          icon: Icon(Icons.share),
+          label: Text('Exportar CSV'),
+          ),
+        ],
+      ),
+    ),
+    ),
+    );
+  }
+  }
+
+    // ----------------- PÁGINA DE MAPA -----------------
+    class MapPage extends StatefulWidget {
+    @override
+    _MapPageState createState() => _MapPageState();
+  }
+
+    class _MapPageState extends State<MapPage> {
+    late GoogleMapController _mapController;
+    final Set<Polyline> _polylines = {};
+    final TaximeterProvider provider = TaximeterProvider();
+    
+    @override
+    void initState() {
+    super.initState();
+    provider.addListener(() {
+    setState(() {
+    _updatePolylines();
+  });
+  });
+  }
+
+    void _updatePolylines() {
+    if (provider.route.isNotEmpty) {
+    _polylines.clear();
+    _polylines.add(Polyline(
+  polylineId: PolylineId('route'),
+  points: provider.route,
+  color: Colors.blue,
+  width: 4,
+    ));
+  }
+  }
+
+    @override
+    Widget build(BuildContext context) {
+    return Scaffold(
+  appBar: AppBar(title: Text('Mapa en vivo')),
+  body: GoogleMap(
+    initialCameraPosition: CameraPosition(
+      target: provider.route.isNotEmpty ? provider.route.last : LatLng(0, 0),
+      zoom: 15,
+    ),
+    polylines: _polylines,
+    onMapCreated: (controller) => _mapController = controller,
+    myLocationEnabled: true,
+    ),
+    );
+  }
+  }
+
+    // ----------------- PÁGINA DE AJUSTES -----------------
+    class SettingsPage extends StatefulWidget {
+    @override
+    _SettingsPageState createState() => _SettingsPageState();
+  }
+
+    class _SettingsPageState extends State<SettingsPage> {
+    final TaximeterProvider provider = TaximeterProvider();
+    late TextEditingController baseCtrl, mileCtrl, waitCtrl;
+    
+    @override
+    void initState() {
+    super.initState();
+  baseCtrl = TextEditingController(text: provider.fareBase.toStringAsFixed(2));
+  mileCtrl = TextEditingController(text: provider.farePerMile.toStringAsFixed(2));
+  waitCtrl = TextEditingController(text: provider.farePerMinuteWait.toStringAsFixed(2));
+  }
+
+    @override
+    Widget build(BuildContext context) {
+    return Scaffold(
+  appBar: AppBar(title: Text('Ajustes')),
+  body: Padding(
+    padding: const EdgeInsets.all(16.0),
+    child: Column(
+      children: [
+        TextField(
+        controller: baseCtrl,
+        keyboardType: TextInputType.numberWithOptions(decimal: true),
+        decoration: InputDecoration(labelText: 'Banderazo (\$)'),
+        onChanged: (val) {
+                           double? v = double.tryParse(val);
+                           if (v != null) provider.fareBase = v;
+        },
+        ),
+        TextField(
+        controller: mileCtrl,
+        keyboardType: TextInputType.numberWithOptions(decimal: true),
+        decoration: InputDecoration(labelText: 'Por milla (\$)'),
+        onChanged: (val) {
+                           double? v = double.tryParse(val);
+                           if (v != null) provider.farePerMile = v;
+        },
+        ),
+        TextField(
+        controller: waitCtrl,
+        keyboardType: TextInputType.numberWithOptions(decimal: true),
+        decoration: InputDecoration(labelText: 'Espera por min (\$)'),
+        onChanged: (val) {
+                           double? v = double.tryParse(val);
+                           if (v != null) provider.farePerMinuteWait = v;
+        },
+        ),
+        SizedBox(height: 20),
+        ElevatedButton(
+        onPressed: () {
+                        provider.updateFares(
+                        double.tryParse(baseCtrl.text) ?? provider.fareBase,
+                        double.tryParse(mileCtrl.text) ?? provider.farePerMile,
+                        double.tryParse(waitCtrl.text) ?? provider.farePerMinuteWait,
+                        );
+                        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Tarifas guardadas')),
+                        );
+        },
+        child: Text('Guardar tarifas'),
+        ),
+        Divider(height: 30),
+        ElevatedButton(
+        onPressed: () {
+                        provider.clearHistory();
+                        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Historial borrado')),
+                        );
+        },
+        child: Text('Borrar historial'),
+        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+        ),
+      ],
+    ),
+    ),
+    );
+  }
+  }
+
+    // Helper para AnimatedBuilder (simplifica la escucha)
+    class AnimatedBuilder extends StatelessWidget {
+    final TaximeterProvider animation;
+    final Widget Function(BuildContext, Widget?) builder;
+    const AnimatedBuilder({required this.animation, required this.builder});
+    @override
+    Widget build(BuildContext context) {
+    return ListenableBuilder(
+  listenable: animation,
+  builder: (context, child) => builder(context, child),
+    );
+  }
+  }
