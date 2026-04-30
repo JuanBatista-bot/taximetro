@@ -1,6 +1,6 @@
 workflows:
-  default-workflow:
-    name: Default Workflow
+  ios-debug:
+    name: iOS Debug
     environment:
       flutter: stable
     scripts:
@@ -8,7 +8,3 @@ workflows:
       - flutter build ios --debug --no-codesign
     artifacts:
       - build/ios/iphoneos/Runner.app
-    publishing:
-      email:
-        recipients:
-          - jbatistaalmaguel@gmail.com
